@@ -2,13 +2,16 @@ import { Graphics, Node, UITransform, Vec2, Vec3 } from 'cc';
 import { ARROW_COLOR, ARROW_GREY, ARROW_HINT, CELL_SIZE, HIT_PAD } from '../config/GameConst';
 import { ArrowDef, Cell, Dir, dirFromCells, dirToDelta } from '../config/LevelData';
 
+export type Pt = { x: number; y: number };
+
 /**
  * 箭头实体：折线通道 + 三角箭头头。
- * 移动时整段沿朝向平移滑出（与主流箭头消除玩法一致）。
+ * 滑出时沿自身折线路径「蛇行」前进（头沿朝向延伸，身尾跟随原路径），
+ * 弯折会逐渐拉直到朝向直线上，而不是整段刚体平移。
  */
 export class ArrowEntity {
     readonly id: number;
-    /** 占格（可在滑出时整体平移） */
+    /** 占格（滑出开始后清空，不再阻挡） */
     cells: Cell[];
     private _facing: Dir;
     readonly node: Node;
@@ -20,6 +23,8 @@ export class ArrowEntity {
     private _originX = 0;
     private _originY = 0;
     private _cellSize = CELL_SIZE;
+    /** 供 tween 驱动的滑出进度 0..1 */
+    slideT = 0;
 
     constructor(id: number, def: ArrowDef, parent: Node) {
         this.id = id;
@@ -105,20 +110,28 @@ export class ArrowEntity {
     }
 
     redraw(): void {
+        if (this.cells.length < 1) {
+            this._g.clear();
+            return;
+        }
+        const pts = this.cells.map((c) => ({
+            x: this._originX + (c.x + 0.5) * this._cellSize,
+            y: this._originY + (c.y + 0.5) * this._cellSize,
+        }));
+        this.redrawPolyline(pts);
+    }
+
+    /** 用任意折线点重绘（滑出动画用） */
+    redrawPolyline(pts: Pt[]): void {
         const g = this._g;
         g.clear();
-        if (this.cells.length < 1) return;
+        if (pts.length < 1) return;
 
         const lw = Math.max(8, this._cellSize * 0.42);
         const color = this._grey ? ARROW_GREY : (this._hint ? ARROW_HINT : ARROW_COLOR);
         g.lineWidth = lw;
         g.strokeColor = color;
         g.fillColor = color;
-
-        const pts = this.cells.map((c) => ({
-            x: this._originX + (c.x + 0.5) * this._cellSize,
-            y: this._originY + (c.y + 0.5) * this._cellSize,
-        }));
 
         const d = this.delta;
         const ux = d.x;

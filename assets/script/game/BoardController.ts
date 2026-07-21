@@ -19,7 +19,7 @@ const PANEL_SIZE = 640;
 const PANEL_HALF = 310;
 
 /**
- * 棋盘：白底 + Mask 裁剪；整段箭头沿朝向平滑滑出；点击取最近箭头。
+ * 棋盘：白底 + Mask 裁剪；箭头沿自身折线路径蛇行滑出；点击取最近箭头。
  */
 export class BoardController {
     readonly root: Node;
@@ -131,6 +131,7 @@ export class BoardController {
 
     clear(): void {
         this._arrows.forEach((a) => {
+            Tween.stopAllByTarget(a);
             if (a.node?.isValid) Tween.stopAllByTarget(a.node);
             a.destroy();
         });
@@ -140,6 +141,7 @@ export class BoardController {
 
     /** 滑出结束后从棋盘移除并销毁箭头节点 */
     private _removeArrow(arrow: ArrowEntity): void {
+        Tween.stopAllByTarget(arrow);
         if (arrow.node?.isValid) {
             Tween.stopAllByTarget(arrow.node);
         }
@@ -303,67 +305,109 @@ export class BoardController {
     }
 
     /**
-     * 沿朝向逐格滑出（网格步进 + 重绘）：
-     * 整段占格每次 +dir，弯道外形不变，但运动轴始终是箭头朝向的直线（参考视频1）。
-     * 不用节点整体 tween，避免弯箭头像「整块飞出去」。
+     * 沿自身折线路径蛇行滑出（对齐参考视频1）：
+     * - 头沿朝向直线延伸离开棋盘
+     * - 身/尾跟随原折线轨道前进（弯折点留在原地，箭头「流过」弯道）
+     * - 外形逐渐被拉直到朝向直线上，而不是整段刚体平移
      */
     private _startSlideOut(arrow: ArrowEntity): void {
         if (!this._level) return;
         arrow.moving = true;
         arrow.setGrey(false);
-        // 滑出过程中不再占用阻挡（与规则一致：移动穿透）
-        this._drawAux();
 
         const d = arrow.delta;
-        const level = this._level;
-        const stepSec = Math.max(0.035, this._cellSize / MOVE_SPEED);
+        const cs = this._cellSize;
+        const ox = this._originX;
+        const oy = this._originY;
+        const toPt = (c: { x: number; y: number }) => ({
+            x: ox + (c.x + 0.5) * cs,
+            y: oy + (c.y + 0.5) * cs,
+        });
 
-        const doStep = () => {
-            if (this._disposed || !arrow.node || !arrow.node.isValid) return;
+        // 轨道 = 原折线（尾→头）+ 沿朝向延伸足够远
+        const path: { x: number; y: number }[] = arrow.cells.map((c) => toPt(c));
+        const headCell = arrow.cells[arrow.cells.length - 1];
+        const bodyCells = arrow.cells.length;
+        const extend = this._level.cols + this._level.rows + bodyCells + 6;
+        for (let i = 1; i <= extend; i++) {
+            path.push(toPt({ x: headCell.x + d.x * i, y: headCell.y + d.y * i }));
+        }
 
-            // 所有格子沿朝向平移一格
-            for (const c of arrow.cells) {
-                c.x += d.x;
-                c.y += d.y;
-            }
+        // 滑出后不再占格阻挡
+        arrow.cells = [];
+        this._drawAux();
 
-            // 仍在缓冲区内的保留；全部离开可视范围则消除
-            const margin = level.cols + level.rows + 2;
-            let w = 0;
-            for (let i = 0; i < arrow.cells.length; i++) {
-                const c = arrow.cells[i];
-                if (
-                    c.x >= -margin && c.y >= -margin &&
-                    c.x < level.cols + margin && c.y < level.rows + margin
-                ) {
-                    arrow.cells[w++] = c;
-                }
-            }
-            arrow.cells.length = w;
-
-            const stillVisible = arrow.cells.some((c) =>
-                c.x >= -1 && c.y >= -1 && c.x <= level.cols && c.y <= level.rows,
+        const cum: number[] = [0];
+        for (let i = 1; i < path.length; i++) {
+            cum.push(
+                cum[i - 1] + Math.hypot(path[i].x - path[i - 1].x, path[i].y - path[i - 1].y),
             );
+        }
+        const bodyLen = cum[bodyCells - 1];
+        // 只需滑到整段离开白框即可，避免拖太久
+        const headPt = path[bodyCells - 1];
+        const half = PANEL_HALF + cs;
+        let clearAlong = bodyLen + cs * 2;
+        if (d.x > 0) clearAlong = (half - headPt.x) + bodyLen + cs;
+        else if (d.x < 0) clearAlong = (headPt.x + half) + bodyLen + cs;
+        else if (d.y > 0) clearAlong = (half - headPt.y) + bodyLen + cs;
+        else if (d.y < 0) clearAlong = (headPt.y + half) + bodyLen + cs;
+        const maxTravel = cum[cum.length - 1] - bodyLen;
+        const travel = Math.max(cs, Math.min(maxTravel, clearAlong));
+        const duration = travel / MOVE_SPEED;
 
-            if (!stillVisible || arrow.cells.length === 0) {
-                this._removeArrow(arrow);
-                this._callbacks.onCleared(arrow);
-                if (this._arrows.length === 0) {
-                    this._callbacks.onBoardEmpty();
-                }
-                return;
-            }
-
-            arrow.redrawWithOrigin(this._originX, this._originY);
-            this._drawAux();
-
-            tween(arrow.node)
-                .delay(stepSec)
-                .call(doStep)
-                .start();
+        const sampleAt = (dist: number): { x: number; y: number } => {
+            const clamped = Math.max(0, Math.min(cum[cum.length - 1], dist));
+            let i = 1;
+            while (i < cum.length && cum[i] < clamped) i++;
+            const i0 = i - 1;
+            const i1 = Math.min(path.length - 1, i);
+            const seg = cum[i1] - cum[i0];
+            const t = seg > 1e-6 ? (clamped - cum[i0]) / seg : 0;
+            return {
+                x: path[i0].x + (path[i1].x - path[i0].x) * t,
+                y: path[i0].y + (path[i1].y - path[i0].y) * t,
+            };
         };
 
-        doStep();
+        const sampleBody = (headDist: number): { x: number; y: number }[] => {
+            const steps = Math.max(12, bodyCells * 5);
+            const pts: { x: number; y: number }[] = [];
+            for (let i = 0; i <= steps; i++) {
+                const dist = headDist - bodyLen + (bodyLen * i) / steps;
+                if (dist >= 0) pts.push(sampleAt(dist));
+            }
+            return pts.length >= 2 ? pts : [sampleAt(headDist), sampleAt(headDist)];
+        };
+
+        const finish = () => {
+            if (this._disposed) return;
+            this._removeArrow(arrow);
+            this._callbacks.onCleared(arrow);
+            if (this._arrows.length === 0) {
+                this._callbacks.onBoardEmpty();
+            }
+        };
+
+        if (!arrow.node || !arrow.node.isValid) {
+            finish();
+            return;
+        }
+
+        arrow.slideT = 0;
+        const updateDraw = () => {
+            if (this._disposed || !arrow.node || !arrow.node.isValid) return;
+            const headDist = bodyLen + travel * arrow.slideT;
+            arrow.redrawPolyline(sampleBody(headDist));
+        };
+        updateDraw();
+
+        tween(arrow)
+            .to(duration, { slideT: 1 }, {
+                onUpdate: updateDraw,
+            })
+            .call(finish)
+            .start();
     }
 
     /**
